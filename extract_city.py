@@ -41,6 +41,12 @@ CITIES = {
         "name_zh": "台南市",
         "name_en": "Tainan City",
     },
+    "taipei": {
+        "match_substrings": ("台北市", "臺北市"),
+        "district_re": re.compile(r"(?:台北市|臺北市)(.{1,4}?區)"),
+        "name_zh": "台北市",
+        "name_en": "Taipei City",
+    },
 }
 
 def normalize_district(name: str) -> str:
@@ -62,12 +68,28 @@ def parse_simple_datetime(s: str):
     return f"{year:04d}{mo:02d}{day:02d}", f"{hh:02d}{mm:02d}{ss:02d}", year, mo
 
 def classify_mode(vehicle_str: str) -> str:
+    """Classify a single vehicle string into one of 機車 / 汽車 / 人 / 慢車 / 其他."""
     v = vehicle_str or ""
     if "機車" in v: return "機車"
     if "客車" in v or "貨車" in v or "曳引" in v: return "汽車"
     if "行人" in v or v.strip() == "人": return "人"
     if "自行車" in v or "慢車" in v: return "慢車"
     return "其他"
+
+# Vulnerability ordering — lower index = more vulnerable.
+# Used to attribute an event to its most vulnerable party, which more
+# closely matches the road-safety question "who dies on the road?".
+VULN_RANK = {"人": 0, "慢車": 1, "機車": 2, "汽車": 3, "其他": 4}
+
+def victim_mode_from_parties(parties: list) -> str:
+    """Most-vulnerable mode present among the event's parties."""
+    if not parties:
+        return "其他"
+    modes = set()
+    for p in parties:
+        text = (p.get("vehicle_main","") or "") + (p.get("vehicle_sub","") or "")
+        modes.add(classify_mode(text))
+    return min(modes, key=lambda m: VULN_RANK.get(m, 9))
 
 def primary_vehicle_simple(vehicle_field: str) -> str:
     return (vehicle_field or "").split(";")[0]
@@ -99,12 +121,19 @@ def extract(city_slug: str):
                     lon = lat = 0.0
                 veh_field = row.get("車種","")
                 principal = primary_vehicle_simple(veh_field)
+                # Simple schema has no per-party rows. Construct pseudo-parties
+                # from the ';'-separated vehicle list so the same victim-mode
+                # rule applies uniformly.
+                pseudo_parties = [{"vehicle_main": v} for v in (veh_field or "").split(";") if v]
+                event_mode = victim_mode_from_parties(pseudo_parties) if pseudo_parties else classify_mode(principal)
                 events.append({
                     "schema": "simple", "roc": roc, "year": cy, "month": month,
                     "date": date, "time": time, "location": loc, "district": district,
                     "lon": lon, "lat": lat,
                     "deaths": deaths, "injuries": injuries,
-                    "mode": classify_mode(principal), "principal_vehicle": principal,
+                    "mode": event_mode,
+                    "principal_mode": classify_mode(principal),
+                    "principal_vehicle": principal,
                     "vehicles_raw": veh_field,
                     "weather":"", "light":"", "road_type":"", "speed_limit":"",
                     "road_shape_main":"", "road_shape_sub":"",
@@ -156,7 +185,10 @@ def extract(city_slug: str):
                     "location":first["發生地點"], "district":district,
                     "lon":lon, "lat":lat,
                     "deaths":deaths, "injuries":injuries,
-                    "mode":classify_mode(principal_main + principal_sub),
+                    # victim-based (most vulnerable party) — primary classification
+                    "mode": victim_mode_from_parties(parties),
+                    # principal-party (P1) — kept for transparency / drill-downs
+                    "principal_mode": classify_mode(principal_main + principal_sub),
                     "principal_vehicle": principal_main + (("·"+principal_sub) if principal_sub else ""),
                     "vehicles_raw":";".join(
                         (r.get("當事者區分-類別-大類別名稱-車種","") or "")
